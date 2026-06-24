@@ -1,0 +1,85 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.READ_LOGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".VoltageLogService"
+            android:exported="true"
+            android:process=":scanner">
+            <intent-filter>
+                <action android:name="com.orbitaldelta.carvoltage.START_SCAN" />
+                <action android:name="com.orbitaldelta.carvoltage.FORCE_RESCAN" />
+                <action android:name="com.orbitaldelta.carvoltage.START" />
+                <action android:name="com.orbitaldelta.carvoltage.KICK" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".AtotoKeepAliveService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.atoto.keepalive" />
+                <action android:name="com.atoto.keepaliveservice.keepAlive" />
+                <action android:name="com.orbitaldelta.carvoltage.keepAlive" />
+                <action android:name="com.orbitaldelta.carvoltage.wakeup" />
+                <action android:name="com.orbitaldelta.carvoltage.START_SCAN" />
+                <action android:name="com.orbitaldelta.carvoltage.WIDGET_RESTART" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+
+
+        <receiver
+    android:name=".VoltageWatchdogReceiver"
+    android:enabled="true"
+    android:exported="false">
+    <intent-filter>
+        <action android:name="com.orbitaldelta.carvoltage.WATCHDOG" />
+    </intent-filter>
+</receiver>
+
+        <receiver
+            android:name=".CarVoltageWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.orbitaldelta.carvoltage.WIDGET_TAP" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/car_voltage_widget_info" />
+        </receiver>
+    </application>
+</manifest>
