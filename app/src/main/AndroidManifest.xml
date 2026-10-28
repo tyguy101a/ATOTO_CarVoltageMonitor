@@ -23,8 +23,7 @@
 
         <service
             android:name=".VoltageLogService"
-            android:exported="true"
-            android:process=":scanner">
+            android:exported="true">
             <intent-filter>
                 <action android:name="com.orbitaldelta.carvoltage.START_SCAN" />
                 <action android:name="com.orbitaldelta.carvoltage.FORCE_RESCAN" />

@@ -17,6 +17,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -40,10 +41,13 @@ public class VoltageLogService extends Service {
     private static final long HEARTBEAT_MS = 30_000L;
     private static final long STALE_RESTART_MS = 90_000L;
     private static final long MAX_LOGCAT_AGE_MS = 20 * 60_000L;
+    private static final long POKE_MIN_INTERVAL_MS = 25_000L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private volatile boolean running;
+    // Each reader thread gets a generation number. Bumping the number tells an
+    // old thread to exit, so a restart can never leave two readers running.
+    private final AtomicInteger readerGeneration = new AtomicInteger();
     private volatile boolean stopRequested;
     private volatile long readerStartedAt;
     private volatile long lastLineAt;
@@ -52,6 +56,8 @@ public class VoltageLogService extends Service {
     private Thread readerThread;
     private Process logcatProcess;
     private int matchCount;
+    private long lastPokeAt;
+    private boolean voltagePropSet;
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
@@ -158,7 +164,7 @@ public class VoltageLogService extends Service {
         long readerAge = readerStartedAt == 0 ? Long.MAX_VALUE : now - readerStartedAt;
 
         Log.d(TAG, "Heartbeat reason=" + reason
-                + " running=" + running
+                + " readerAlive=" + (readerThread != null && readerThread.isAlive())
                 + " lastMatchAgeMs=" + printableAge(lastMatchAge)
                 + " lastLineAgeMs=" + printableAge(lastLineAge)
                 + " readerAgeMs=" + printableAge(readerAge)
@@ -168,7 +174,7 @@ public class VoltageLogService extends Service {
         CarVoltageWidgetProvider.updateAll(this);
         pokeStockVoltageRefresh();
 
-        if (!running || readerThread == null || !readerThread.isAlive()) {
+        if (readerThread == null || !readerThread.isAlive()) {
             Log.d(TAG, "Reader not alive. Restarting logcat reader.");
             restartReader();
             return;
@@ -185,21 +191,54 @@ public class VoltageLogService extends Service {
     }
 
     private void pokeStockVoltageRefresh() {
+        // Heartbeats arrive from the timer, the keepalive service and the watchdog,
+        // so don't poke the head unit more than about twice a minute.
+        long now = System.currentTimeMillis();
+        if (now - lastPokeAt < POKE_MIN_INTERVAL_MS) return;
+        lastPokeAt = now;
+
+        if (!voltagePropSet) {
+            voltagePropSet = true;
+            runQuietly("setprop", "persist.fyt.voltage_visible", "1");
+        }
         try {
-            Runtime.getRuntime().exec(new String[]{"setprop", "persist.fyt.voltage_visible", "1"});
-            Runtime.getRuntime().exec(new String[]{"am", "broadcast", "-a", "com.syu.voltage.visible"});
+            // Same broadcast `am broadcast -a com.syu.voltage.visible` sent, without
+            // spawning a new process every heartbeat.
+            sendBroadcast(new Intent("com.syu.voltage.visible"));
             Log.d(TAG, "Poked stock voltage refresh.");
         } catch (Exception e) {
             Log.e(TAG, "Stock voltage refresh poke failed.", e);
         }
     }
 
+    /** Runs a shell command on a background thread and always reaps the process. */
+    private static void runQuietly(final String... command) {
+        new Thread(() -> {
+            Process p = null;
+            try {
+                p = new ProcessBuilder(command).redirectErrorStream(true).start();
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                    while (r.readLine() != null) { /* drain */ }
+                }
+                p.waitFor();
+            } catch (Exception e) {
+                Log.e(TAG, "Command failed: " + Arrays.toString(command), e);
+            } finally {
+                if (p != null) p.destroy();
+            }
+        }, "car-voltage-cmd").start();
+    }
+
+    private boolean isCurrent(int generation) {
+        return !stopRequested && generation == readerGeneration.get();
+    }
+
     private synchronized void startReader() {
-        if (running && readerThread != null && readerThread.isAlive()) return;
-        running = true;
+        if (readerThread != null && readerThread.isAlive()) return;
+        final int generation = readerGeneration.incrementAndGet();
         readerStartedAt = System.currentTimeMillis();
         lastLineAt = 0L;
-        readerThread = new Thread(this::readLoop, "car-voltage-logcat-reader");
+        readerThread = new Thread(() -> readLoop(generation), "car-voltage-logcat-reader-" + generation);
         readerThread.start();
     }
 
@@ -209,7 +248,7 @@ public class VoltageLogService extends Service {
     }
 
     private synchronized void stopReader() {
-        running = false;
+        readerGeneration.incrementAndGet();
         if (logcatProcess != null) {
             logcatProcess.destroy();
             logcatProcess = null;
@@ -220,30 +259,33 @@ public class VoltageLogService extends Service {
         }
     }
 
-    private void readLoop() {
+    private void readLoop(int generation) {
         String[][] commands = new String[][]{
                 {"logcat", "-v", "time", "-T", "1", "remote:E", "hzq5:I", "*:S"},
                 {"logcat", "-v", "time", "-T", "1", "*:E"},
                 {"logcat", "-v", "time", "-T", "1"}
         };
 
-        while (running) {
+        while (isCurrent(generation)) {
             boolean matchedThisPass = false;
             for (String[] command : commands) {
-                if (!running) return;
+                if (!isCurrent(generation)) return;
                 Log.d(TAG, "Trying logcat command: " + Arrays.toString(command));
+                Process process = null;
                 try {
-                    ProcessBuilder pb = new ProcessBuilder(command);
-                    pb.redirectErrorStream(true);
-                    logcatProcess = pb.start();
+                    process = new ProcessBuilder(command).redirectErrorStream(true).start();
+                    synchronized (this) {
+                        if (!isCurrent(generation)) return; // finally destroys it
+                        logcatProcess = process;
+                    }
                     readerStartedAt = System.currentTimeMillis();
                     lastLineAt = 0L;
 
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(logcatProcess.getInputStream()))) {
+                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                         String line;
                         int linesSeen = 0;
 
-                        while (running && (line = reader.readLine()) != null) {
+                        while (isCurrent(generation) && (line = reader.readLine()) != null) {
                             linesSeen++;
                             lastLineAt = System.currentTimeMillis();
 
@@ -257,28 +299,32 @@ public class VoltageLogService extends Service {
                         }
                     }
                 } catch (IOException e) {
-                    Log.e(TAG, "Unable to run logcat command " + Arrays.toString(command), e);
-                    broadcastStatusOnly();
+                    if (isCurrent(generation)) {
+                        Log.e(TAG, "Unable to run logcat command " + Arrays.toString(command), e);
+                        broadcastStatusOnly();
+                    }
                 } finally {
-                    if (logcatProcess != null) {
-                        logcatProcess.destroy();
-                        logcatProcess = null;
+                    // Only ever touch this thread's own process, never a newer reader's.
+                    if (process != null) process.destroy();
+                    synchronized (this) {
+                        if (logcatProcess == process) logcatProcess = null;
                     }
                 }
 
-                if (matchedThisPass || !running) {
+                if (matchedThisPass || !isCurrent(generation)) {
                     break;
                 }
             }
 
-            if (running) {
+            if (isCurrent(generation)) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
         }
+        Log.d(TAG, "Reader generation " + generation + " exited.");
     }
 
     private boolean handleLine(String line) {
